@@ -1,13 +1,23 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js'
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js'
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js'
+import type { BeaconConfig } from '../types'
 
 const MODEL_URL = '/model/LiangxiangMap.glb'
+
+// 组件参数：光柱配置（位置、标注文字、点击回调等）由外部传入
+const props = withDefaults(defineProps<{ beacons: BeaconConfig[] }>(), {
+  beacons: () => [],
+})
+const emit = defineEmits<{
+  (e: 'beacon-select', beacon: BeaconConfig): void
+  (e: 'beacon-close'): void
+}>()
 
 // ---- 可调参数 ----------------------------------------------------------
 // 楼块颜色（纯白）
@@ -82,6 +92,7 @@ const BEACON_CORE_OPACITY = 0.8
 const BEACON_INTENSITY = 1.7 // HDR 亮度倍数（初始亮度，>1 才会触发 Bloom 发光）
 // 悬停高亮（鼠标射线最接近的光柱）：更亮、更高、波纹更快、文字更大
 const BEACON_HOVER_RADIUS_RATIO = 0.05 // 判定半径 = 相机距离 * 该比例（约等于屏幕上的像素半径）
+const BEACON_HOVER_KEEP_MULTIPLIER = 1.5 // 迟滞：已悬停时保持的半径倍数，避免边界抖动
 const BEACON_HOVER_BRIGHTNESS = 1.9 // 亮度倍数
 const BEACON_HOVER_HEIGHT = 1.6 // 高度倍数
 const BEACON_HOVER_RIPPLE_SPEED = 2.2 // 波纹速度倍数
@@ -116,12 +127,12 @@ const BEACON_LABEL_ZOOM_COMPENSATION = 1
 // 它只定义"标准大小"对应的距离（此时文字世界高度 = BEACON_LABEL_HEIGHT）；
 // 因此调整 CAMERA_START_DISTANCE 时，同一 distance 下的文字大小保持不变。
 const BEACON_LABEL_REFERENCE_DISTANCE = 1800
-// 信标位置：x / z 是相对"模型中心"的水平偏移（模型局部坐标；+X 东，+Z 南）
-const BEACONS = [
-  { label: '网协办公室', x: 300, z: 325 },
-  { label: '图书馆电脑诊所', x: 480, z: 280 },
-  { label: '求是社区电脑诊所', x: 200, z: 460 },
-]
+// —— 点击光柱后的聚焦视角 ——
+const BEACON_FOCUS_DISTANCE = 400 // 近距离观察时的相机距离
+const BEACON_FOCUS_ELEVATION_DEG = 25 // 聚焦时的高度角
+const BEACON_FOCUS_TARGET_HEIGHT = 120 // 注视点在光柱底部之上的高度（看向光柱中部）
+const BEACON_FOCUS_SHIFT_RATIO = 0.22 // 光柱在画面上偏左的量（占可见宽度的比例）
+const BEACON_FOCUS_EASE = 6 // 聚焦/退出过渡速度（越大越快）
 
 // 辉光（Bloom）：强度 / 半径 / 阈值（阈值越高，只有越亮的东西发光）
 const BLOOM_STRENGTH = 0.7
@@ -143,31 +154,44 @@ let canvasEl: HTMLCanvasElement | null = null
 
 // 模型（拖拽时移动它）
 let model: THREE.Object3D | null = null
+let modelCenter = new THREE.Vector3()
+let modelBaseY = 0
 // 地面网格（跟随模型移动）
 let grid: THREE.LineSegments | null = null
 let gridHalfSpan = 0
-// 信标动画（共享材质 + 时钟）
-let beaconParticleMaterial: THREE.ShaderMaterial | null = null
 const beaconClock = new THREE.Clock()
 // 信标运行时状态（用于悬停高亮、随缩放调整文字等）
 interface BeaconRuntime {
+  config: BeaconConfig
   root: THREE.Group
   pillar: THREE.Mesh
   core: THREE.Mesh
   pillarMaterial: THREE.ShaderMaterial
   coreMaterial: THREE.ShaderMaterial
+  particleMaterial: THREE.ShaderMaterial
   rippleMaterial: THREE.ShaderMaterial
   label: THREE.Sprite | null
   hover: number // 0 = 常态, 1 = 完全悬停（带缓动）
+  dim: number // 0 = 正常, 1 = 熄灭（其他光柱在聚焦时熄灭，带缓动）
   ripplePhase: number // 累加的波纹相位（避免改变速度时相位跳变）
+  rayDistance: number // 本帧鼠标射线到光柱轴线的距离（用于悬停迟滞）
 }
-const beacons: BeaconRuntime[] = []
+const beaconRuntimes: BeaconRuntime[] = []
+const beaconLabels: THREE.Sprite[] = []
+let beaconGroup: THREE.Group | null = null
 // 鼠标悬停用的射线与指针位置（NDC）
 const pointerNdc = new THREE.Vector2(-2, -2)
 const raycaster = new THREE.Raycaster()
 const _beaconBase = new THREE.Vector3()
-const _beaconSample = new THREE.Vector3()
 let beaconElapsed = 0
+// 悬停 / 点击 / 聚焦状态
+let currentHovered: BeaconRuntime | null = null
+let pressedBeacon: BeaconRuntime | null = null
+let pressConsumed = false
+let focusedIndex = -1
+let focusAmount = 0
+// 当前实际使用的相机距离（聚焦时会偏离用户缩放的 distance）
+let effectiveDistance = CAMERA_START_DISTANCE
 
 // 相机轨道状态：相机始终看向原点，位置由 水平角(罗盘朝向) + 高度角 + 距离 决定
 let bearing = THREE.MathUtils.degToRad(CAMERA_BEARING_DEG)
@@ -186,6 +210,23 @@ let pinchMidY = 0
 const WORLD_UP = new THREE.Vector3(0, 1, 0)
 const _forwardGround = new THREE.Vector3()
 const _right = new THREE.Vector3()
+const _lookDir = new THREE.Vector3()
+const _camTarget = new THREE.Vector3()
+const _focusBase = new THREE.Vector3()
+const _focusTarget = new THREE.Vector3()
+const _focusRight = new THREE.Vector3()
+const _pickNdc = new THREE.Vector2()
+// 退出聚焦时用于平滑回到常态（记住上一次的聚焦目标）
+const _lastFocusTarget = new THREE.Vector3()
+let lastFocusDistance = CAMERA_START_DISTANCE
+let lastFocusElevation = THREE.MathUtils.degToRad(BEACON_FOCUS_ELEVATION_DEG)
+// 射线-线段最近距离计算的临时变量
+const _segStart = new THREE.Vector3()
+const _segEnd = new THREE.Vector3()
+const _segDir = new THREE.Vector3()
+const _rayToSegStart = new THREE.Vector3()
+const _closestOnRay = new THREE.Vector3()
+const _closestOnSeg = new THREE.Vector3()
 
 /** 缩放(距离) -> 高度角：距离最大(缩小)时 80°，距离最小(放大)时 30°，中间线性 */
 function elevationForDistance(value: number) {
@@ -209,43 +250,89 @@ function fadeEndRatioForDistance(value: number) {
 }
 
 /** 把当前缩放对应的网格渐变范围写进着色器 */
-function updateGridFadeRange() {
+function updateGridFadeRange(value: number) {
   if (!grid) return
   const material = grid.material as THREE.ShaderMaterial
   const fadeStart = gridHalfSpan * GRID_FADE_START_RATIO
-  const fadeEnd = Math.max(gridHalfSpan * fadeEndRatioForDistance(distance), fadeStart + 1e-4)
+  const fadeEnd = Math.max(gridHalfSpan * fadeEndRatioForDistance(value), fadeStart + 1e-4)
   material.uniforms.uFadeStart.value = fadeStart
   material.uniforms.uFadeEnd.value = fadeEnd
 }
 
-/** 根据当前轨道状态更新相机位置，并让相机始终朝向原点 */
-function updateCamera() {
-  if (!camera) return
-  elevation = elevationForDistance(distance)
-
-  // 镜头朝向的罗盘方向 -> 世界方向：东 = +X，北 = -Z
-  const lookX = Math.sin(bearing)
-  const lookZ = -Math.cos(bearing)
-  const horizontal = distance * Math.cos(elevation)
-  camera.position.set(
-    -horizontal * lookX,
-    distance * Math.sin(elevation),
-    -horizontal * lookZ,
-  )
-  camera.up.copy(WORLD_UP)
-  camera.lookAt(CAMERA_TARGET)
-  camera.updateMatrixWorld()
-  updateGridFadeRange()
+/** 网格渐变中心跟随相机注视点 */
+function updateGridFadeCenter(target: THREE.Vector3) {
+  if (!grid) return
+  const material = grid.material as THREE.ShaderMaterial
+  material.uniforms.uFadeCenter.value.set(target.x, target.z)
 }
 
-/** 缩放：改变相机到原点的距离，并同步耦合高度角 */
+/**
+ * 每帧更新相机。常态下看向 CAMERA_TARGET(原点)；
+ * 聚焦某根光柱时，注视点平移到该光柱"右侧"一点，使光柱落在画面左侧，并拉近距离。
+ */
+function updateCameraFrame(delta: number) {
+  if (!camera) return
+
+  const focused = focusedIndex >= 0 ? beaconRuntimes[focusedIndex] ?? null : null
+  const focusTargetAmount = focused ? 1 : 0
+  focusAmount += (focusTargetAmount - focusAmount) * (1 - Math.exp(-BEACON_FOCUS_EASE * delta))
+  if (!focused && focusAmount < 1e-4) focusAmount = 0
+
+  const baseElevation = elevationForDistance(distance)
+  let frameDistance = distance
+  let frameElevation = baseElevation
+  _camTarget.copy(CAMERA_TARGET)
+
+  const lookX = Math.sin(bearing)
+  const lookZ = -Math.cos(bearing)
+  _lookDir.set(lookX, 0, lookZ)
+
+  if (focused && focusAmount > 0) {
+    focused.root.getWorldPosition(_focusBase)
+    _focusRight.crossVectors(_lookDir, WORLD_UP).normalize()
+    const visibleHeight =
+      2 * BEACON_FOCUS_DISTANCE * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2))
+    const visibleWidth = visibleHeight * (camera.aspect || 1)
+    _focusTarget.copy(_focusBase)
+    _focusTarget.y += BEACON_FOCUS_TARGET_HEIGHT
+    // 注视点向相机右方向偏移 -> 光柱出现在画面左侧
+    _focusTarget.addScaledVector(_focusRight, visibleWidth * BEACON_FOCUS_SHIFT_RATIO)
+
+    // 记录下来，退出聚焦时据此平滑回到常态
+    _lastFocusTarget.copy(_focusTarget)
+    lastFocusDistance = BEACON_FOCUS_DISTANCE
+    lastFocusElevation = THREE.MathUtils.degToRad(BEACON_FOCUS_ELEVATION_DEG)
+  }
+
+  if (focusAmount > 0) {
+    _camTarget.lerp(_lastFocusTarget, focusAmount)
+    frameDistance = THREE.MathUtils.lerp(distance, lastFocusDistance, focusAmount)
+    frameElevation = THREE.MathUtils.lerp(baseElevation, lastFocusElevation, focusAmount)
+  }
+
+  elevation = frameElevation
+  effectiveDistance = frameDistance
+
+  const horizontal = frameDistance * Math.cos(frameElevation)
+  camera.position.set(
+    _camTarget.x - horizontal * lookX,
+    _camTarget.y + frameDistance * Math.sin(frameElevation),
+    _camTarget.z - horizontal * lookZ,
+  )
+  camera.up.copy(WORLD_UP)
+  camera.lookAt(_camTarget)
+  camera.updateMatrixWorld()
+  updateGridFadeRange(frameDistance)
+  updateGridFadeCenter(_camTarget)
+}
+
+/** 缩放：改变相机到注视点的距离（高度角在每帧的 updateCameraFrame 里耦合） */
 function zoomBy(factor: number) {
   distance = THREE.MathUtils.clamp(
     distance * factor,
     CAMERA_MIN_DISTANCE,
     CAMERA_MAX_DISTANCE,
   )
-  updateCamera()
 }
 
 /** 拖拽：不移动相机，而是把模型沿相机的地面朝向平移（不改变高度角） */
@@ -253,7 +340,7 @@ function panModelByPixels(dx: number, dy: number) {
   if (!model || !camera) return
 
   const viewportHeight = containerRef.value?.clientHeight || 1
-  const visibleHeight = 2 * distance * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2))
+  const visibleHeight = 2 * effectiveDistance * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2))
   const unitsPerPixel = visibleHeight / viewportHeight
 
   // 相机"朝向原点"的方向在地面上的投影，以及它的右手方向
@@ -686,8 +773,8 @@ function createBeaconParticles() {
   geometry.setAttribute('aTravel', new THREE.BufferAttribute(travels, 1))
   geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1))
 
-  if (!beaconParticleMaterial) beaconParticleMaterial = createBeaconParticleMaterial()
-  const points = new THREE.Points(geometry, beaconParticleMaterial)
+  // 每根光柱一份粒子材质，便于单独淡入淡出（熄灭）
+  const points = new THREE.Points(geometry, createBeaconParticleMaterial())
   points.frustumCulled = false // 粒子会升到几何包围盒之外
   return points
 }
@@ -742,7 +829,7 @@ function createBeaconRippleMaterial() {
 }
 
 /** 生成一根信标（底部在 group 原点）：光柱 + 内芯 + 上升粒子 + 底部波纹 + 文字标注 */
-function createBeacon(label: string): BeaconRuntime {
+function createBeacon(config: BeaconConfig): BeaconRuntime {
   const root = new THREE.Group()
 
   const pillarMaterial = createBeaconPillarMaterial(BEACON_OPACITY)
@@ -761,7 +848,9 @@ function createBeacon(label: string): BeaconRuntime {
   core.position.y = BEACON_HEIGHT / 2
   root.add(core)
 
-  root.add(createBeaconParticles())
+  const particles = createBeaconParticles()
+  root.add(particles)
+  const particleMaterial = particles.material as THREE.ShaderMaterial
 
   const rippleMaterial = createBeaconRippleMaterial()
   const ripple = new THREE.Mesh(
@@ -772,58 +861,141 @@ function createBeacon(label: string): BeaconRuntime {
   ripple.position.y = BEACON_RIPPLE_LIFT
   root.add(ripple)
 
-  const sprite = createBeaconLabel(label)
+  const sprite = createBeaconLabel(config.label)
   if (sprite) {
     // 文字放到独立场景（世界坐标，每帧跟随信标），不随光柱受光照/Bloom 影响
     labelScene?.add(sprite)
+    beaconLabels.push(sprite)
   }
 
   const record: BeaconRuntime = {
+    config,
     root,
     pillar,
     core,
     pillarMaterial,
     coreMaterial,
+    particleMaterial,
     rippleMaterial,
     label: sprite,
     hover: 0,
+    dim: 0,
     ripplePhase: 0,
+    rayDistance: Infinity,
   }
-  beacons.push(record)
+  beaconRuntimes.push(record)
   return record
+}
+
+/**
+ * 射线(origin->direction, t>=0) 到线段(p0->p1, s∈[0,1]) 的最短距离。
+ * 直接解最近点（几何法），不用沿轴线采样——采样会随悬停时的高度变化而变，导致抖动。
+ */
+function distanceRayToSegment(
+  origin: THREE.Vector3,
+  direction: THREE.Vector3,
+  p0: THREE.Vector3,
+  p1: THREE.Vector3,
+): number {
+  const d2 = _segDir.subVectors(p1, p0)
+  const r = _rayToSegStart.subVectors(origin, p0)
+  const e = d2.dot(d2)
+
+  if (e < 1e-9) {
+    // 退化成点：求该点到射线的距离
+    const s = Math.max(-r.dot(direction), 0)
+    _closestOnRay.copy(origin).addScaledVector(direction, s)
+    return _closestOnRay.distanceTo(p0)
+  }
+
+  const a = 1 // direction 已归一化
+  const b = direction.dot(d2)
+  const c = direction.dot(r)
+  const f = d2.dot(r)
+  const denom = a * e - b * b
+
+  let s: number
+  let t: number
+  if (denom > 1e-9) {
+    s = (b * f - c * e) / denom
+    t = (b * s + f) / e
+  } else {
+    s = 0
+    t = f / e
+  }
+
+  // 线段参数限制到 [0, 1]
+  if (t < 0) {
+    t = 0
+    s = -c
+  } else if (t > 1) {
+    t = 1
+    s = b - c
+  }
+  // 射线参数限制到 >= 0
+  if (s < 0) {
+    s = 0
+    t = THREE.MathUtils.clamp(f / e, 0, 1)
+  }
+
+  _closestOnRay.copy(origin).addScaledVector(direction, s)
+  _closestOnSeg.copy(p0).addScaledVector(d2, t)
+  return _closestOnRay.distanceTo(_closestOnSeg)
 }
 
 /** 每帧更新信标：按鼠标射线挑选最近的光柱作为悬停目标，并缓动应用高亮效果 */
 function updateBeaconStates(delta: number) {
-  let hovered: BeaconRuntime | null = null
-  let bestDistance = Infinity
+  const focusedRecord = focusedIndex >= 0 ? beaconRuntimes[focusedIndex] ?? null : null
+  const acquireRadius = effectiveDistance * BEACON_HOVER_RADIUS_RATIO
+  const keepRadius = acquireRadius * BEACON_HOVER_KEEP_MULTIPLIER
 
+  // 计算每条光柱轴线到鼠标射线的距离，取最近的（几何最近点，且用固定高度，不受悬停动画影响）
+  let nearest: BeaconRuntime | null = null
+  let nearestDistance = Infinity
   if (camera) {
     raycaster.setFromCamera(pointerNdc, camera)
-    const threshold = distance * BEACON_HOVER_RADIUS_RATIO
-    for (const record of beacons) {
+    const ray = raycaster.ray
+    for (const record of beaconRuntimes) {
       record.root.getWorldPosition(_beaconBase)
-      // 沿光柱轴线取几个采样点，取到射线的最近距离
-      for (let i = 0; i <= 3; i++) {
-        _beaconSample.set(_beaconBase.x, _beaconBase.y + (BEACON_HEIGHT * i) / 3, _beaconBase.z)
-        const d = raycaster.ray.distanceToPoint(_beaconSample)
-        if (d < bestDistance) {
-          bestDistance = d
-          hovered = record
-        }
+      _segStart.copy(_beaconBase)
+      _segEnd.set(_beaconBase.x, _beaconBase.y + BEACON_HEIGHT, _beaconBase.z)
+      record.rayDistance = distanceRayToSegment(ray.origin, ray.direction, _segStart, _segEnd)
+      // 聚焦时只有被聚焦的光柱可悬停（其它已熄灭）
+      if (focusedRecord && record !== focusedRecord) continue
+      if (record.rayDistance < nearestDistance) {
+        nearestDistance = record.rayDistance
+        nearest = record
       }
     }
-    if (bestDistance > threshold) hovered = null
   }
 
+  // 迟滞：进入用 acquireRadius，保持用更大的 keepRadius，避免边界处来回跳变
+  let hovered: BeaconRuntime | null = null
+  if (nearest && nearestDistance <= acquireRadius) {
+    hovered = nearest
+  } else if (
+    currentHovered &&
+    (!focusedRecord || currentHovered === focusedRecord) &&
+    currentHovered.rayDistance <= keepRadius
+  ) {
+    hovered = currentHovered
+  }
+  currentHovered = hovered
+
   const ease = 1 - Math.exp(-BEACON_HOVER_EASE * delta)
-  for (const record of beacons) {
+  for (let index = 0; index < beaconRuntimes.length; index++) {
+    const record = beaconRuntimes[index]
     const target = record === hovered ? 1 : 0
     record.hover += (target - record.hover) * ease
     const h = record.hover
 
+    // 熄灭程度：聚焦时其它光柱 -> 1
+    const dimTarget = focusedIndex >= 0 && index !== focusedIndex ? 1 : 0
+    record.dim += (dimTarget - record.dim) * ease
+    const lit = 1 - record.dim
+
     // 亮度
-    const brightness = BEACON_INTENSITY * (1 + h * (BEACON_HOVER_BRIGHTNESS - 1))
+    const brightness = BEACON_INTENSITY * (1 + h * (BEACON_HOVER_BRIGHTNESS - 1)) * lit
     record.pillarMaterial.uniforms.uIntensity.value = brightness
     record.coreMaterial.uniforms.uIntensity.value = brightness
 
@@ -834,23 +1006,33 @@ function updateBeaconStates(delta: number) {
     record.pillar.position.y = (BEACON_HEIGHT * heightScale) / 2
     record.core.position.y = (BEACON_HEIGHT * heightScale) / 2
 
+    // 粒子
+    record.particleMaterial.uniforms.uTime.value = beaconElapsed
+    record.particleMaterial.uniforms.uViewportHeight.value = renderer
+      ? renderer.domElement.height
+      : 1
+    record.particleMaterial.uniforms.uOpacity.value = BEACON_PARTICLE_OPACITY * lit
+
     // 波纹：速度乘在高亮系数上；相位用积分累加，速度变化时相位连续、不会跳变
     const rippleSpeed = BEACON_RIPPLE_SPEED * (1 + h * (BEACON_HOVER_RIPPLE_SPEED - 1))
     record.ripplePhase += rippleSpeed * delta
     record.rippleMaterial.uniforms.uPhase.value = record.ripplePhase
+    record.rippleMaterial.uniforms.uOpacity.value = BEACON_RIPPLE_OPACITY * lit
 
     // 文字：缩放补偿 + 悬停放大，并按左边缘对齐
     const label = record.label
     if (label) {
       record.root.getWorldPosition(_beaconBase)
-      // 只依赖当前 distance（参考距离是固定常量），与 CAMERA_START_DISTANCE 无关
-      const ratio = distance / BEACON_LABEL_REFERENCE_DISTANCE
+      // 只依赖当前实际距离（参考距离是固定常量），与 CAMERA_START_DISTANCE 无关
+      const ratio = effectiveDistance / BEACON_LABEL_REFERENCE_DISTANCE
       const zoomFactor = Math.pow(ratio, BEACON_LABEL_ZOOM_COMPENSATION)
       const factor = zoomFactor * (1 + h * (BEACON_HOVER_LABEL_SCALE - 1))
       const baseWidth = (label.userData.baseWidth as number) ?? 1
       const baseHeight = (label.userData.baseHeight as number) ?? 1
       const width = baseWidth * factor
       label.scale.set(width, baseHeight * factor, 1)
+      label.material.opacity = lit
+      label.visible = record.dim < 0.99
       // 世界坐标定位（模型根只有平移，所以世界偏移 = 本地偏移）
       label.position.set(
         _beaconBase.x + BEACON_LABEL_OFFSET_X + width / 2,
@@ -861,18 +1043,39 @@ function updateBeaconStates(delta: number) {
   }
 }
 
-/** 把所有信标挂到模型上（随模型一起移动），位置相对模型中心、底部贴模型底面 */
-function addBeacons(root: THREE.Object3D, modelCenter: THREE.Vector3, modelBaseY: number) {
-  const group = new THREE.Group()
-  group.name = 'beacons'
+/** 所有信标挂到模型上（随模型一起移动），位置相对模型中心、底部贴模型底面 */
+function addBeacons(root: THREE.Object3D, center: THREE.Vector3, baseY: number) {
+  beaconGroup = new THREE.Group()
+  beaconGroup.name = 'beacons'
 
-  for (const beacon of BEACONS) {
-    const record = createBeacon(beacon.label)
-    record.root.position.set(modelCenter.x + beacon.x, modelBaseY, modelCenter.z + beacon.z)
-    group.add(record.root)
+  for (const config of props.beacons) {
+    const record = createBeacon(config)
+    record.root.position.set(center.x + config.x, baseY, center.z + config.z)
+    beaconGroup.add(record.root)
   }
 
-  root.add(group)
+  root.add(beaconGroup)
+}
+
+/** 清理并按最新 props 重建光柱（props 变化时调用） */
+function rebuildBeacons() {
+  if (!model) return
+  for (const sprite of beaconLabels) {
+    labelScene?.remove(sprite)
+    disposeObjectTree(sprite)
+  }
+  beaconLabels.length = 0
+  if (beaconGroup) {
+    model.remove(beaconGroup)
+    disposeObjectTree(beaconGroup)
+    beaconGroup = null
+  }
+  beaconRuntimes.length = 0
+  currentHovered = null
+  pressedBeacon = null
+  focusedIndex = -1
+  focusAmount = 0
+  addBeacons(model, modelCenter, modelBaseY)
 }
 
 /**
@@ -958,11 +1161,13 @@ function setupModel(loaded: THREE.Object3D) {
     INITIAL_COORD.z - center.z,
   )
 
+  model = loaded
+  modelCenter.copy(center)
+  modelBaseY = box.min.y
+
   addWaterGlow(loaded, size)
   // 信标挂到模型上，随模型移动；位置相对模型中心、底部贴模型底面(box.min.y)
-  addBeacons(loaded, center, box.min.y)
-
-  model = loaded
+  addBeacons(loaded, modelCenter, modelBaseY)
 
   // 网格跟随模型：位置与模型保持一致（y 固定在地面平面）
   grid = createGroundGrid(size)
@@ -976,12 +1181,73 @@ function setupModel(loaded: THREE.Object3D) {
     CAMERA_MIN_DISTANCE,
     CAMERA_MAX_DISTANCE,
   )
-  updateCamera()
+  updateCameraFrame(0)
+}
+
+function setPointerNdc(clientX: number, clientY: number) {
+  if (!canvasEl) return
+  const rect = canvasEl.getBoundingClientRect()
+  pointerNdc.x = ((clientX - rect.left) / rect.width) * 2 - 1
+  pointerNdc.y = -((clientY - rect.top) / rect.height) * 2 + 1
+}
+
+/** 用屏幕坐标做射线拾取，返回最近且在阈值内的光柱 */
+function pickBeaconAt(clientX: number, clientY: number): BeaconRuntime | null {
+  if (!camera || !canvasEl) return null
+  const rect = canvasEl.getBoundingClientRect()
+  _pickNdc.set(
+    ((clientX - rect.left) / rect.width) * 2 - 1,
+    -((clientY - rect.top) / rect.height) * 2 + 1,
+  )
+  raycaster.setFromCamera(_pickNdc, camera)
+  const threshold = effectiveDistance * BEACON_HOVER_RADIUS_RATIO
+  const ray = raycaster.ray
+
+  let best: BeaconRuntime | null = null
+  let bestDistance = Infinity
+  for (const record of beaconRuntimes) {
+    if (focusedIndex >= 0 && beaconRuntimes[focusedIndex] !== record) continue
+    record.root.getWorldPosition(_beaconBase)
+    _segStart.copy(_beaconBase)
+    _segEnd.set(_beaconBase.x, _beaconBase.y + BEACON_HEIGHT, _beaconBase.z)
+    const d = distanceRayToSegment(ray.origin, ray.direction, _segStart, _segEnd)
+    if (d < bestDistance) {
+      bestDistance = d
+      best = record
+    }
+  }
+  return bestDistance <= threshold ? best : null
+}
+
+/** 点击光柱：聚焦该光柱（其它光柱熄灭），并通知外部 */
+function activateBeacon(record: BeaconRuntime) {
+  const index = beaconRuntimes.indexOf(record)
+  if (index < 0) return
+  focusedIndex = index
+  emit('beacon-select', record.config)
+  record.config.onClick?.(record.config)
+}
+
+/** 退出聚焦：恢复点击前的视角与其它光柱 */
+function exitFocus() {
+  if (focusedIndex < 0) return
+  focusedIndex = -1
+  emit('beacon-close')
 }
 
 function onPointerDown(event: PointerEvent) {
   canvasEl?.setPointerCapture(event.pointerId)
   activePointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
+  setPointerNdc(event.clientX, event.clientY)
+
+  // 聚焦状态下任意 mousedown：恢复到点击前的视角，并恢复其它光柱；本次按下不再触发拖拽/点击
+  if (focusedIndex >= 0) {
+    exitFocus()
+    pointerMode = 'none'
+    pressedBeacon = null
+    pressConsumed = true
+    return
+  }
 
   if (activePointers.size === 2) {
     const [p1, p2] = [...activePointers.values()]
@@ -989,6 +1255,8 @@ function onPointerDown(event: PointerEvent) {
     pinchMidX = (p1.x + p2.x) / 2
     pinchMidY = (p1.y + p2.y) / 2
     pointerMode = 'none'
+    pressedBeacon = null
+    pressConsumed = true
     return
   }
   if (activePointers.size > 2) return
@@ -997,15 +1265,14 @@ function onPointerDown(event: PointerEvent) {
   pointerMode = event.button === 2 ? 'pan' : 'rotate'
   lastX = event.clientX
   lastY = event.clientY
+  pressConsumed = false
+  // 记录按下瞬间悬停的光柱（点击要求按下与抬起时都悬停在同一个光柱上）
+  pressedBeacon = event.button === 0 ? pickBeaconAt(event.clientX, event.clientY) : null
 }
 
 function onPointerMove(event: PointerEvent) {
   // 无论是否在拖拽，都记录指针位置用于悬停检测
-  if (canvasEl) {
-    const rect = canvasEl.getBoundingClientRect()
-    pointerNdc.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
-    pointerNdc.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
-  }
+  setPointerNdc(event.clientX, event.clientY)
 
   if (!activePointers.has(event.pointerId)) return
   activePointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
@@ -1036,7 +1303,6 @@ function onPointerMove(event: PointerEvent) {
   if (pointerMode === 'rotate') {
     // 只改变水平角（罗盘朝向），不改变高度角
     bearing += dx * ORBIT_SPEED
-    updateCamera()
   } else if (pointerMode === 'pan') {
     panModelByPixels(dx, dy)
   }
@@ -1048,17 +1314,25 @@ function onPointerUp(event: PointerEvent) {
     canvasEl.releasePointerCapture(event.pointerId)
   }
 
-  if (activePointers.size < 2) pinchDistance = 0
-  if (activePointers.size === 0) {
-    pointerMode = 'none'
-  } else {
-    // 松开一根手指后，剩下的手指需要重新按下才继续操作，避免误触
-    pointerMode = 'none'
+  // 点击：mousedown 与 mouseup 都悬停在同一个光柱上才触发
+  if (event.button === 0 && pressedBeacon && !pressConsumed) {
+    const upBeacon = pickBeaconAt(event.clientX, event.clientY)
+    if (upBeacon && upBeacon === pressedBeacon) {
+      activateBeacon(upBeacon)
+    }
   }
+  pressedBeacon = null
+  pressConsumed = false
+
+  if (activePointers.size < 2) pinchDistance = 0
+  // 松开一根手指后，剩下的手指需要重新按下才继续操作，避免误触
+  pointerMode = 'none'
 }
 
 function onWheel(event: WheelEvent) {
   event.preventDefault()
+  // 聚焦状态下不改变缩放，保证退出后能准确回到点击前的视角
+  if (focusedIndex >= 0) return
   zoomBy(Math.exp(event.deltaY * ZOOM_SPEED))
 }
 
@@ -1101,7 +1375,7 @@ function init() {
   labelScene = new THREE.Scene()
 
   camera = new THREE.PerspectiveCamera(45, width / height, 10, 30000)
-  updateCamera()
+  updateCameraFrame(0)
 
   renderer = new THREE.WebGLRenderer({ antialias: true })
   renderer.setPixelRatio(pixelRatio)
@@ -1169,13 +1443,7 @@ function init() {
       grid.position.x = model.position.x
       grid.position.z = model.position.z
     }
-    // 信标动画：共享粒子材质的时间
-    if (beaconParticleMaterial) {
-      beaconParticleMaterial.uniforms.uTime.value = beaconElapsed
-      if (renderer) {
-        beaconParticleMaterial.uniforms.uViewportHeight.value = renderer.domElement.height
-      }
-    }
+    updateCameraFrame(delta)
     updateBeaconStates(delta)
     composer?.render()
     // 后期之后再画文字，使其完全不受辉光影响
@@ -1242,8 +1510,21 @@ function dispose() {
   camera = null
   model = null
   grid = null
-  beacons.length = 0
+  beaconGroup = null
+  beaconRuntimes.length = 0
+  beaconLabels.length = 0
+  currentHovered = null
+  pressedBeacon = null
+  focusedIndex = -1
+  focusAmount = 0
 }
+
+// props 变化时按最新配置重建光柱
+watch(
+  () => props.beacons,
+  () => rebuildBeacons(),
+  { deep: true },
+)
 
 onMounted(init)
 onBeforeUnmount(dispose)
