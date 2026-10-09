@@ -8,7 +8,8 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js'
 import type { BeaconConfig } from '../types'
 
-const MODEL_URL = '/model/LiangxiangMap.glb'
+// 用 BASE_URL 前缀，保证部署到子路径（GitHub Pages）时也能正确加载
+const MODEL_URL = `${import.meta.env.BASE_URL}model/LiangxiangMap.glb`
 
 // 组件参数：光柱配置（位置、标注文字、点击回调等）由外部传入
 const props = withDefaults(defineProps<{ beacons: BeaconConfig[] }>(), {

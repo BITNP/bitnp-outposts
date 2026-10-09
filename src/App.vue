@@ -4,6 +4,9 @@ import BitnpMap from './components/BitnpMap.vue'
 import type { BeaconConfig } from './types'
 import logoUrl from './assets/BITNP-logo.png'
 
+// 视频放在 public/ 下，会随 base 一起部署（注意 public 里的文件直接用根路径引用，不带 "public/"）
+const officeVideoUrl = `${import.meta.env.BASE_URL}video/BITNP Office.mp4`
+
 // 光柱配置：位置(x/z 为相对模型中心的水平偏移)、标注文字、点击回调
 const beacons: BeaconConfig[] = [
   { id: 'office', label: '网协办公室', x: 300, z: 325 },
@@ -40,7 +43,7 @@ function onClose() {
           <p class="panel__body">
             描述：网协办公室/活动室
           </p>
-          <video src="/public/video/BITNP Office.mp4" style="width: 80%;" controls></video>
+          <video :src="officeVideoUrl" style="width: 80%" controls></video>
         </template>
         <template v-else-if="selected.id === 'qiushi'">
           <p class="panel__body">
