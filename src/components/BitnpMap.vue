@@ -27,11 +27,11 @@ const CONTOUR_OPACITY = 0.85
 
 // —— 初始坐标常量 ——
 // 模型初始中心位置（相对原点 / 网格中心）。相机初始位置不再由它决定。
-const INITIAL_COORD = { x: -400, y: 0, z: -200 }
+const INITIAL_COORD = { x: -400, y: 0, z: -300 }
 
 // —— 相机与缩放 ——
 // 相机到原点的初始距离（决定初始缩放）
-const CAMERA_START_DISTANCE = 1800
+const CAMERA_START_DISTANCE = 800
 // 缩放范围：距离越小 = 放大（缩放比例大），距离越大 = 缩小（缩放比例小）
 const CAMERA_MIN_DISTANCE = 600
 const CAMERA_MAX_DISTANCE = 1800
@@ -44,7 +44,7 @@ const CAMERA_TARGET = new THREE.Vector3(0, 0, 0)
 // 镜头在水平面内朝向的罗盘方向：0 = 北, 90 = 东, 180 = 南, 270 = 西。
 // 初始 0 即"上北下南"（模型约定：东 = +X，北 = -Z，来自 Blender/OSM 导出惯例；
 // 若你模型的朝向不同，只改这一个值即可）。
-const CAMERA_BEARING_DEG = 0
+const CAMERA_BEARING_DEG = -20
 
 // —— 交互灵敏度 ——
 const ORBIT_SPEED = 0.006 // 旋转：弧度/像素
@@ -71,6 +71,58 @@ const GRID_FADE_END_RATIO_MAX = 0.70
 // 淡出曲线指数：1 = 线性，越大越"晚"才开始明显变淡
 const GRID_FADE_CURVE = 1.5
 
+// —— 信标（黄色科幻光柱 + 黄色文字标注）——
+// 颜色 / 尺寸
+const BEACON_COLOR = 0xffd24a
+const BEACON_HEIGHT = 220
+const BEACON_RADIUS = 8
+const BEACON_CORE_RADIUS = 5
+const BEACON_OPACITY = 0.4
+const BEACON_CORE_OPACITY = 0.8
+const BEACON_INTENSITY = 1.7 // HDR 亮度倍数（初始亮度，>1 才会触发 Bloom 发光）
+// 悬停高亮（鼠标射线最接近的光柱）：更亮、更高、波纹更快、文字更大
+const BEACON_HOVER_RADIUS_RATIO = 0.05 // 判定半径 = 相机距离 * 该比例（约等于屏幕上的像素半径）
+const BEACON_HOVER_BRIGHTNESS = 1.9 // 亮度倍数
+const BEACON_HOVER_HEIGHT = 1.6 // 高度倍数
+const BEACON_HOVER_RIPPLE_SPEED = 2.2 // 波纹速度倍数
+const BEACON_HOVER_LABEL_SCALE = 1.35 // 文字大小倍数
+const BEACON_HOVER_EASE = 8 // 过渡速度（越大越快）
+// 上升粒子
+const BEACON_PARTICLE_COUNT = 60 // 每根光柱的粒子数
+const BEACON_PARTICLE_SIZE = 7 // 粒子直径（世界单位，按透视缩放）
+const BEACON_PARTICLE_OPACITY = 0.9
+const BEACON_PARTICLE_SPEED_MIN = 40 // 上升速度（世界单位/秒）最小值
+const BEACON_PARTICLE_SPEED_MAX = 110 // 最大值（速度随机）
+const BEACON_PARTICLE_HEIGHT_MIN = 0.45 // 上升距离（相对光柱高度）最小值
+const BEACON_PARTICLE_HEIGHT_MAX = 1.0 // 最大值（上升距离随机）
+const BEACON_PARTICLE_RADIUS = 6 // 粒子出现的水平半径范围
+// 底部圆形波纹
+const BEACON_RIPPLE_COUNT = 3
+const BEACON_RIPPLE_RADIUS = 120 // 波纹最大半径
+const BEACON_RIPPLE_SPEED = 0.2 // 每秒扩散圈数
+const BEACON_RIPPLE_THICKNESS = 0.06 // 环宽（0~1）
+const BEACON_RIPPLE_OPACITY = 0.9
+const BEACON_RIPPLE_LIFT = 1.0 // 相对模型底面的抬高，避免与地面共面闪烁
+// 文字标注
+const BEACON_LABEL_COLOR = '#ffd24a'
+const BEACON_LABEL_HEIGHT = 45 // 文字在世界里的高度
+const BEACON_LABEL_Y = 150 // 文字中心相对信标底部的高度
+// 文字"左边缘"相对光柱中心的水平距离。缩放时这个间隙保持不变，
+// 而文字宽度会随缩放变小，所以文字会自动更靠近光柱。
+const BEACON_LABEL_OFFSET_X = 20
+// 文字随缩放的补偿强度：1 = 屏幕尺寸基本不变，0 = 不补偿（正常透视缩放）
+const BEACON_LABEL_ZOOM_COMPENSATION = 1
+// 文字尺寸的参考距离：固定常量，与 CAMERA_START_DISTANCE 无关。
+// 它只定义"标准大小"对应的距离（此时文字世界高度 = BEACON_LABEL_HEIGHT）；
+// 因此调整 CAMERA_START_DISTANCE 时，同一 distance 下的文字大小保持不变。
+const BEACON_LABEL_REFERENCE_DISTANCE = 1800
+// 信标位置：x / z 是相对"模型中心"的水平偏移（模型局部坐标；+X 东，+Z 南）
+const BEACONS = [
+  { label: '网协办公室', x: 300, z: 325 },
+  { label: '图书馆电脑诊所', x: 480, z: 280 },
+  { label: '求是社区电脑诊所', x: 200, z: 460 },
+]
+
 // 辉光（Bloom）：强度 / 半径 / 阈值（阈值越高，只有越亮的东西发光）
 const BLOOM_STRENGTH = 0.7
 const BLOOM_RADIUS = 0.5
@@ -81,6 +133,8 @@ const containerRef = ref<HTMLDivElement | null>(null)
 
 let renderer: THREE.WebGLRenderer | null = null
 let scene: THREE.Scene | null = null
+// 标注文字单独一个场景，在后期(Bloom)之后绘制，保证不受光照/辉光影响、始终清晰
+let labelScene: THREE.Scene | null = null
 let camera: THREE.PerspectiveCamera | null = null
 let composer: EffectComposer | null = null
 let resizeObserver: ResizeObserver | null = null
@@ -92,6 +146,28 @@ let model: THREE.Object3D | null = null
 // 地面网格（跟随模型移动）
 let grid: THREE.LineSegments | null = null
 let gridHalfSpan = 0
+// 信标动画（共享材质 + 时钟）
+let beaconParticleMaterial: THREE.ShaderMaterial | null = null
+const beaconClock = new THREE.Clock()
+// 信标运行时状态（用于悬停高亮、随缩放调整文字等）
+interface BeaconRuntime {
+  root: THREE.Group
+  pillar: THREE.Mesh
+  core: THREE.Mesh
+  pillarMaterial: THREE.ShaderMaterial
+  coreMaterial: THREE.ShaderMaterial
+  rippleMaterial: THREE.ShaderMaterial
+  label: THREE.Sprite | null
+  hover: number // 0 = 常态, 1 = 完全悬停（带缓动）
+  ripplePhase: number // 累加的波纹相位（避免改变速度时相位跳变）
+}
+const beacons: BeaconRuntime[] = []
+// 鼠标悬停用的射线与指针位置（NDC）
+const pointerNdc = new THREE.Vector2(-2, -2)
+const raycaster = new THREE.Raycaster()
+const _beaconBase = new THREE.Vector3()
+const _beaconSample = new THREE.Vector3()
+let beaconElapsed = 0
 
 // 相机轨道状态：相机始终看向原点，位置由 水平角(罗盘朝向) + 高度角 + 距离 决定
 let bearing = THREE.MathUtils.degToRad(CAMERA_BEARING_DEG)
@@ -158,6 +234,7 @@ function updateCamera() {
   )
   camera.up.copy(WORLD_UP)
   camera.lookAt(CAMERA_TARGET)
+  camera.updateMatrixWorld()
   updateGridFadeRange()
 }
 
@@ -440,6 +517,364 @@ function addWaterGlow(root: THREE.Object3D, modelSize: THREE.Vector3) {
   })
 }
 
+/** 光柱材质：沿高度向上渐隐，颜色乘 uIntensity 进入 HDR 以获得 Bloom 辉光 */
+function createBeaconPillarMaterial(opacity: number) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: new THREE.Color(BEACON_COLOR) },
+      uHeight: { value: BEACON_HEIGHT },
+      uOpacity: { value: opacity },
+      uIntensity: { value: BEACON_INTENSITY },
+    },
+    vertexShader: /* glsl */ `
+      uniform float uHeight;
+      varying float vH;
+      void main() {
+        vH = (position.y + uHeight * 0.5) / uHeight; // 0 = 底部, 1 = 顶部
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uColor;
+      uniform float uOpacity;
+      uniform float uIntensity;
+      varying float vH;
+      void main() {
+        float fade = pow(1.0 - clamp(vH, 0.0, 1.0), 1.6);
+        gl_FragColor = vec4(uColor * uIntensity, fade * uOpacity);
+      }
+    `,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  })
+}
+
+/** 用 canvas 画黄色文字，做成始终朝向相机的 Sprite 标注 */
+function createBeaconLabel(text: string) {
+  const fontSize = 72
+  const padding = 28
+  const font = `bold ${fontSize}px "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif`
+
+  const measureCanvas = document.createElement('canvas')
+  const measureCtx = measureCanvas.getContext('2d')
+  if (!measureCtx) return null
+  measureCtx.font = font
+  const textWidth = Math.ceil(measureCtx.measureText(text).width)
+
+  const canvas = document.createElement('canvas')
+  canvas.width = textWidth + padding * 2
+  canvas.height = fontSize + padding * 2
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return null
+
+  ctx.font = font
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.lineJoin = 'round'
+  ctx.lineWidth = 8
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.85)'
+  ctx.strokeText(text, canvas.width / 2, canvas.height / 2)
+  ctx.shadowColor = BEACON_LABEL_COLOR
+  ctx.shadowBlur = 18
+  ctx.fillStyle = BEACON_LABEL_COLOR
+  ctx.fillText(text, canvas.width / 2, canvas.height / 2)
+
+  const texture = new THREE.CanvasTexture(canvas)
+  texture.colorSpace = THREE.SRGBColorSpace
+  texture.anisotropy = 4
+
+  const material = new THREE.SpriteMaterial({
+    map: texture,
+    transparent: true,
+    depthWrite: false,
+    depthTest: false, // 文字单独在后期之后绘制，始终在最上层
+    toneMapped: false, // 不受色调映射影响，颜色保持原样
+  })
+
+  const sprite = new THREE.Sprite(material)
+  const aspect = canvas.width / canvas.height
+  const baseWidth = BEACON_LABEL_HEIGHT * aspect
+  const baseHeight = BEACON_LABEL_HEIGHT
+  sprite.userData.baseWidth = baseWidth
+  sprite.userData.baseHeight = baseHeight
+  sprite.scale.set(baseWidth, baseHeight, 1)
+  return sprite
+}
+
+/** 上升粒子材质（所有信标共用，逐粒子随机由几何属性提供） */
+function createBeaconParticleMaterial() {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 },
+      uViewportHeight: { value: 1 },
+      uColor: { value: new THREE.Color(BEACON_COLOR) },
+      uIntensity: { value: BEACON_INTENSITY },
+      uOpacity: { value: BEACON_PARTICLE_OPACITY },
+    },
+    vertexShader: /* glsl */ `
+      uniform float uTime;
+      uniform float uViewportHeight;
+      attribute float aPhase;
+      attribute float aSpeed;
+      attribute float aTravel;
+      attribute float aSize;
+      varying float vAlpha;
+      void main() {
+        // 以随机相位在 0~1 之间循环，progress 越大升得越高
+        float progress = fract(aPhase + uTime * aSpeed / max(aTravel, 1e-3));
+        vec3 p = vec3(position.x, progress * aTravel, position.z);
+        vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+        // 透视缩放：世界尺寸 -> 屏幕像素
+        gl_PointSize = aSize * projectionMatrix[1][1] * uViewportHeight * 0.5 / max(-mvPosition.z, 1.0);
+        vAlpha = pow(1.0 - progress, 1.5); // 越往上越暗，最终消失
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uColor;
+      uniform float uIntensity;
+      uniform float uOpacity;
+      varying float vAlpha;
+      void main() {
+        vec2 uv = gl_PointCoord - 0.5;
+        float d = length(uv);
+        if (d > 0.5) discard;
+        float a = (1.0 - smoothstep(0.0, 0.5, d)) * vAlpha * uOpacity;
+        if (a <= 0.001) discard;
+        gl_FragColor = vec4(uColor * uIntensity, a);
+      }
+    `,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  })
+}
+
+/** 一束上升粒子：位置存于 position.xz，y 由着色器随进度上升 */
+function createBeaconParticles() {
+  const count = BEACON_PARTICLE_COUNT
+  const positions = new Float32Array(count * 3)
+  const phases = new Float32Array(count)
+  const speeds = new Float32Array(count)
+  const travels = new Float32Array(count)
+  const sizes = new Float32Array(count)
+
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2
+    const radius = Math.sqrt(Math.random()) * BEACON_PARTICLE_RADIUS
+    positions[i * 3] = Math.cos(angle) * radius
+    positions[i * 3 + 1] = 0
+    positions[i * 3 + 2] = Math.sin(angle) * radius
+    phases[i] = Math.random()
+    speeds[i] = THREE.MathUtils.lerp(
+      BEACON_PARTICLE_SPEED_MIN,
+      BEACON_PARTICLE_SPEED_MAX,
+      Math.random(),
+    )
+    travels[i] =
+      BEACON_HEIGHT *
+      THREE.MathUtils.lerp(BEACON_PARTICLE_HEIGHT_MIN, BEACON_PARTICLE_HEIGHT_MAX, Math.random())
+    sizes[i] = BEACON_PARTICLE_SIZE * (0.6 + Math.random() * 0.8)
+  }
+
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geometry.setAttribute('aPhase', new THREE.BufferAttribute(phases, 1))
+  geometry.setAttribute('aSpeed', new THREE.BufferAttribute(speeds, 1))
+  geometry.setAttribute('aTravel', new THREE.BufferAttribute(travels, 1))
+  geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1))
+
+  if (!beaconParticleMaterial) beaconParticleMaterial = createBeaconParticleMaterial()
+  const points = new THREE.Points(geometry, beaconParticleMaterial)
+  points.frustumCulled = false // 粒子会升到几何包围盒之外
+  return points
+}
+
+/** 底部波纹材质（所有信标共用；环数通过宏注入，因为 GLSL 循环需要常量上界） */
+function createBeaconRippleMaterial() {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      // 累加相位：每帧 += 速度 * dt，速度变化时相位连续，不会跳变
+      uPhase: { value: 0 },
+      uColor: { value: new THREE.Color(BEACON_COLOR) },
+      uIntensity: { value: BEACON_INTENSITY },
+      uOpacity: { value: BEACON_RIPPLE_OPACITY },
+      uThickness: { value: BEACON_RIPPLE_THICKNESS },
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      #define RING_COUNT ${BEACON_RIPPLE_COUNT}
+      uniform float uPhase;
+      uniform vec3 uColor;
+      uniform float uIntensity;
+      uniform float uOpacity;
+      uniform float uThickness;
+      varying vec2 vUv;
+      void main() {
+        float r = length(vUv - 0.5) * 2.0; // 0 = 中心, 1 = 边缘
+        if (r > 1.0) discard;
+        float ripple = 0.0;
+        for (int i = 0; i < RING_COUNT; i++) {
+          float phase = fract(uPhase + float(i) / float(RING_COUNT));
+          float ringR = phase; // 环半径由 0 向外扩散到 1
+          float ring = 1.0 - smoothstep(0.0, uThickness, abs(r - ringR));
+          ripple += ring * (1.0 - phase); // 越往外越淡
+        }
+        float alpha = clamp(ripple, 0.0, 1.0) * uOpacity;
+        alpha *= 1.0 - smoothstep(0.85, 1.0, r); // 外缘柔化
+        if (alpha <= 0.001) discard;
+        gl_FragColor = vec4(uColor * uIntensity, alpha);
+      }
+    `,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  })
+}
+
+/** 生成一根信标（底部在 group 原点）：光柱 + 内芯 + 上升粒子 + 底部波纹 + 文字标注 */
+function createBeacon(label: string): BeaconRuntime {
+  const root = new THREE.Group()
+
+  const pillarMaterial = createBeaconPillarMaterial(BEACON_OPACITY)
+  const pillar = new THREE.Mesh(
+    new THREE.CylinderGeometry(BEACON_RADIUS, BEACON_RADIUS, BEACON_HEIGHT, 24, 1, true),
+    pillarMaterial,
+  )
+  pillar.position.y = BEACON_HEIGHT / 2
+  root.add(pillar)
+
+  const coreMaterial = createBeaconPillarMaterial(BEACON_CORE_OPACITY)
+  const core = new THREE.Mesh(
+    new THREE.CylinderGeometry(BEACON_CORE_RADIUS, BEACON_CORE_RADIUS, BEACON_HEIGHT, 16, 1, true),
+    coreMaterial,
+  )
+  core.position.y = BEACON_HEIGHT / 2
+  root.add(core)
+
+  root.add(createBeaconParticles())
+
+  const rippleMaterial = createBeaconRippleMaterial()
+  const ripple = new THREE.Mesh(
+    new THREE.CircleGeometry(BEACON_RIPPLE_RADIUS, 48),
+    rippleMaterial,
+  )
+  ripple.rotation.x = -Math.PI / 2
+  ripple.position.y = BEACON_RIPPLE_LIFT
+  root.add(ripple)
+
+  const sprite = createBeaconLabel(label)
+  if (sprite) {
+    // 文字放到独立场景（世界坐标，每帧跟随信标），不随光柱受光照/Bloom 影响
+    labelScene?.add(sprite)
+  }
+
+  const record: BeaconRuntime = {
+    root,
+    pillar,
+    core,
+    pillarMaterial,
+    coreMaterial,
+    rippleMaterial,
+    label: sprite,
+    hover: 0,
+    ripplePhase: 0,
+  }
+  beacons.push(record)
+  return record
+}
+
+/** 每帧更新信标：按鼠标射线挑选最近的光柱作为悬停目标，并缓动应用高亮效果 */
+function updateBeaconStates(delta: number) {
+  let hovered: BeaconRuntime | null = null
+  let bestDistance = Infinity
+
+  if (camera) {
+    raycaster.setFromCamera(pointerNdc, camera)
+    const threshold = distance * BEACON_HOVER_RADIUS_RATIO
+    for (const record of beacons) {
+      record.root.getWorldPosition(_beaconBase)
+      // 沿光柱轴线取几个采样点，取到射线的最近距离
+      for (let i = 0; i <= 3; i++) {
+        _beaconSample.set(_beaconBase.x, _beaconBase.y + (BEACON_HEIGHT * i) / 3, _beaconBase.z)
+        const d = raycaster.ray.distanceToPoint(_beaconSample)
+        if (d < bestDistance) {
+          bestDistance = d
+          hovered = record
+        }
+      }
+    }
+    if (bestDistance > threshold) hovered = null
+  }
+
+  const ease = 1 - Math.exp(-BEACON_HOVER_EASE * delta)
+  for (const record of beacons) {
+    const target = record === hovered ? 1 : 0
+    record.hover += (target - record.hover) * ease
+    const h = record.hover
+
+    // 亮度
+    const brightness = BEACON_INTENSITY * (1 + h * (BEACON_HOVER_BRIGHTNESS - 1))
+    record.pillarMaterial.uniforms.uIntensity.value = brightness
+    record.coreMaterial.uniforms.uIntensity.value = brightness
+
+    // 高度（只缩放竖直方向，着色器的渐变不受影响）
+    const heightScale = 1 + h * (BEACON_HOVER_HEIGHT - 1)
+    record.pillar.scale.y = heightScale
+    record.core.scale.y = heightScale
+    record.pillar.position.y = (BEACON_HEIGHT * heightScale) / 2
+    record.core.position.y = (BEACON_HEIGHT * heightScale) / 2
+
+    // 波纹：速度乘在高亮系数上；相位用积分累加，速度变化时相位连续、不会跳变
+    const rippleSpeed = BEACON_RIPPLE_SPEED * (1 + h * (BEACON_HOVER_RIPPLE_SPEED - 1))
+    record.ripplePhase += rippleSpeed * delta
+    record.rippleMaterial.uniforms.uPhase.value = record.ripplePhase
+
+    // 文字：缩放补偿 + 悬停放大，并按左边缘对齐
+    const label = record.label
+    if (label) {
+      record.root.getWorldPosition(_beaconBase)
+      // 只依赖当前 distance（参考距离是固定常量），与 CAMERA_START_DISTANCE 无关
+      const ratio = distance / BEACON_LABEL_REFERENCE_DISTANCE
+      const zoomFactor = Math.pow(ratio, BEACON_LABEL_ZOOM_COMPENSATION)
+      const factor = zoomFactor * (1 + h * (BEACON_HOVER_LABEL_SCALE - 1))
+      const baseWidth = (label.userData.baseWidth as number) ?? 1
+      const baseHeight = (label.userData.baseHeight as number) ?? 1
+      const width = baseWidth * factor
+      label.scale.set(width, baseHeight * factor, 1)
+      // 世界坐标定位（模型根只有平移，所以世界偏移 = 本地偏移）
+      label.position.set(
+        _beaconBase.x + BEACON_LABEL_OFFSET_X + width / 2,
+        _beaconBase.y + BEACON_LABEL_Y,
+        _beaconBase.z,
+      )
+    }
+  }
+}
+
+/** 把所有信标挂到模型上（随模型一起移动），位置相对模型中心、底部贴模型底面 */
+function addBeacons(root: THREE.Object3D, modelCenter: THREE.Vector3, modelBaseY: number) {
+  const group = new THREE.Group()
+  group.name = 'beacons'
+
+  for (const beacon of BEACONS) {
+    const record = createBeacon(beacon.label)
+    record.root.position.set(modelCenter.x + beacon.x, modelBaseY, modelCenter.z + beacon.z)
+    group.add(record.root)
+  }
+
+  root.add(group)
+}
+
 /**
  * 白色科幻网格。网格本身会跟随模型平移（见渲染循环），
  * 而径向淡出在着色器里按"世界坐标到相机注视点(CAMERA_TARGET)的距离"计算，
@@ -524,6 +959,8 @@ function setupModel(loaded: THREE.Object3D) {
   )
 
   addWaterGlow(loaded, size)
+  // 信标挂到模型上，随模型移动；位置相对模型中心、底部贴模型底面(box.min.y)
+  addBeacons(loaded, center, box.min.y)
 
   model = loaded
 
@@ -563,6 +1000,13 @@ function onPointerDown(event: PointerEvent) {
 }
 
 function onPointerMove(event: PointerEvent) {
+  // 无论是否在拖拽，都记录指针位置用于悬停检测
+  if (canvasEl) {
+    const rect = canvasEl.getBoundingClientRect()
+    pointerNdc.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
+    pointerNdc.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
+  }
+
   if (!activePointers.has(event.pointerId)) return
   activePointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
 
@@ -618,6 +1062,11 @@ function onWheel(event: WheelEvent) {
   zoomBy(Math.exp(event.deltaY * ZOOM_SPEED))
 }
 
+function onPointerLeave() {
+  // 指针移出画布后不再悬停任何光柱
+  pointerNdc.set(-2, -2)
+}
+
 function onContextMenu(event: MouseEvent) {
   event.preventDefault()
 }
@@ -649,6 +1098,7 @@ function init() {
 
   scene = new THREE.Scene()
   scene.background = new THREE.Color(0x0b1020)
+  labelScene = new THREE.Scene()
 
   camera = new THREE.PerspectiveCamera(45, width / height, 10, 30000)
   updateCamera()
@@ -665,6 +1115,7 @@ function init() {
   canvasEl.addEventListener('pointermove', onPointerMove)
   canvasEl.addEventListener('pointerup', onPointerUp)
   canvasEl.addEventListener('pointercancel', onPointerUp)
+  canvasEl.addEventListener('pointerleave', onPointerLeave)
   canvasEl.addEventListener('wheel', onWheel, { passive: false })
   canvasEl.addEventListener('contextmenu', onContextMenu)
 
@@ -711,14 +1162,51 @@ function init() {
 
   const renderLoop = () => {
     animationId = requestAnimationFrame(renderLoop)
+    const delta = Math.min(beaconClock.getDelta(), 0.1)
+    beaconElapsed += delta
     // 网格随模型一起移动（渐变中心固定在相机注视点，由着色器处理）
     if (grid && model) {
       grid.position.x = model.position.x
       grid.position.z = model.position.z
     }
+    // 信标动画：共享粒子材质的时间
+    if (beaconParticleMaterial) {
+      beaconParticleMaterial.uniforms.uTime.value = beaconElapsed
+      if (renderer) {
+        beaconParticleMaterial.uniforms.uViewportHeight.value = renderer.domElement.height
+      }
+    }
+    updateBeaconStates(delta)
     composer?.render()
+    // 后期之后再画文字，使其完全不受辉光影响
+    if (renderer && labelScene && camera) {
+      renderer.autoClear = false
+      renderer.render(labelScene, camera)
+      renderer.autoClear = true
+    }
   }
   renderLoop()
+}
+
+/** 释放材质，并顺带释放它引用的贴图（例如文字 Sprite 的 CanvasTexture） */
+function disposeMaterial(material: THREE.Material) {
+  const withMap = material as THREE.Material & { map?: THREE.Texture | null }
+  withMap.map?.dispose()
+  material.dispose()
+}
+
+/** 释放一棵对象树里的几何体与材质 */
+function disposeObjectTree(root: THREE.Object3D) {
+  root.traverse((object) => {
+    const mesh = object as THREE.Mesh
+    if (mesh.geometry) mesh.geometry.dispose()
+    const material = mesh.material
+    if (Array.isArray(material)) {
+      material.forEach((item) => disposeMaterial(item))
+    } else if (material) {
+      disposeMaterial(material)
+    }
+  })
 }
 
 function dispose() {
@@ -732,6 +1220,7 @@ function dispose() {
     canvasEl.removeEventListener('pointermove', onPointerMove)
     canvasEl.removeEventListener('pointerup', onPointerUp)
     canvasEl.removeEventListener('pointercancel', onPointerUp)
+    canvasEl.removeEventListener('pointerleave', onPointerLeave)
     canvasEl.removeEventListener('wheel', onWheel)
     canvasEl.removeEventListener('contextmenu', onContextMenu)
     canvasEl = null
@@ -746,20 +1235,14 @@ function dispose() {
     renderer = null
   }
 
-  scene?.traverse((object) => {
-    const mesh = object as THREE.Mesh
-    if (mesh.geometry) mesh.geometry.dispose()
-    const material = mesh.material
-    if (Array.isArray(material)) {
-      material.forEach((item) => item.dispose())
-    } else if (material) {
-      material.dispose()
-    }
-  })
+  if (scene) disposeObjectTree(scene)
+  if (labelScene) disposeObjectTree(labelScene)
   scene = null
+  labelScene = null
   camera = null
   model = null
   grid = null
+  beacons.length = 0
 }
 
 onMounted(init)
