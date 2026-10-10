@@ -10,6 +10,8 @@ import type { BeaconConfig } from '../types'
 
 // 用 BASE_URL 前缀，保证部署到子路径（GitHub Pages）时也能正确加载
 const MODEL_URL = `${import.meta.env.BASE_URL}model/LiangxiangMap.glb`
+// 地面等高线模型（400×400 的平面等高线，含高程起伏）
+const CONTOUR_URL = `${import.meta.env.BASE_URL}model/contour.glb`
 
 // 组件参数：光柱配置（位置、标注文字、点击回调等）由外部传入
 const props = withDefaults(defineProps<{ beacons: BeaconConfig[] }>(), {
@@ -78,9 +80,35 @@ const GRID_FADE_START_RATIO = 0.2
 // "结束半径"随缩放变化（相对网格半边长）：
 // 缩到最小时（相机最远）= MIN，放到最大时（相机最近）= MAX，中间线性
 const GRID_FADE_END_RATIO_MIN = 0.25
-const GRID_FADE_END_RATIO_MAX = 0.70
+const GRID_FADE_END_RATIO_MAX = 0.40
 // 淡出曲线指数：1 = 线性，越大越"晚"才开始明显变淡
 const GRID_FADE_CURVE = 1.5
+
+// —— 地面等高线（public/model/contour.glb）——
+// 源模型：平面 400×400，高程（Z）约 1~99；导出时会平移到模型中心下方的地面
+const CONTOUR_GROUND_COLOR = GRID_COLOR
+const CONTOUR_GROUND_OPACITY = GRID_OPACITY
+// 等高线"接棒"网格：从网格完全消失处（网格淡出结束半径）开始，向外经过该过渡带逐渐完全显现，
+// 之后不再衰减。过渡带宽度 = 等高线半边长 × 该比例。
+const CONTOUR_RISE_RATIO = 0.15
+// 接棒点相对"网格淡出结束半径"的倍数：1 = 严格从网格完全消失处开始（默认）；
+// < 1 会让等高线更早出现，与网格淡出的尾巴有一点重叠（想让等高线在默认视角里也看得见时可调小）。
+const CONTOUR_TAKEOVER_RATIO = 1.0
+// 等高线自身的"远处淡出"范围（用等高线半边长(span / 2)的比例表示）：
+// 到 CONTOUR_FADE_START 之后开始变淡，到 CONTOUR_FADE_END 完全消失，用来把方形的几何边界藏掉。
+const CONTOUR_FADE_START_RATIO = 0.8
+const CONTOUR_FADE_END_RATIO = 1.0
+// 等高线"完全消失半径"的上限（相对网格完全消失半径的倍数）：
+// 即等高线最晚也要在 2.0 × 网格消失半径处淡到 0；与上面的自身边缘淡出取更靠内的那个。
+const CONTOUR_FADE_MAX_RATIO = 2.0
+// 等高线铺满的地面边长（单位与模型一致）。默认与网格一致 = 4000（源模型 400 放大 10 倍）
+const CONTOUR_SPAN = GRID_SPAN
+// 若 CONTOUR_SPAN <= 0，则用"模型水平尺寸 × 该比例"代替
+const CONTOUR_SPAN_RATIO = GRID_SPAN_RATIO
+// 高程方向缩放：0 = 完全平铺在地面（避开楼块）；>0 时按源模型高程(1~99)放大成起伏地形
+const CONTOUR_HEIGHT_SCALE = 0
+// 地面（网格 / 等高线）所在的高度（模型底面被抬到 y = 1，这里保持 y = 0 即位于地图下方）
+const GROUND_Y = 0
 
 // —— 信标（黄色科幻光柱 + 黄色文字标注）——
 // 颜色 / 尺寸
@@ -157,9 +185,14 @@ let canvasEl: HTMLCanvasElement | null = null
 let model: THREE.Object3D | null = null
 let modelCenter = new THREE.Vector3()
 let modelBaseY = 0
-// 地面网格（跟随模型移动）
-let grid: THREE.LineSegments | null = null
+let modelSize = new THREE.Vector3()
+// 地面：网格（中心向外淡出）+ 等高线（从网格消失处向外显现），两者同时显示、跟随模型移动
+let groundGrid: THREE.LineSegments | null = null
+let groundContour: THREE.LineSegments | null = null
 let gridHalfSpan = 0
+let contourHalfSpan = 0
+// 已加载、但还没摆到地面的等高线模型
+let contourRoot: THREE.Object3D | null = null
 const beaconClock = new THREE.Clock()
 // 信标运行时状态（用于悬停高亮、随缩放调整文字等）
 interface BeaconRuntime {
@@ -217,6 +250,8 @@ const _focusBase = new THREE.Vector3()
 const _focusTarget = new THREE.Vector3()
 const _focusRight = new THREE.Vector3()
 const _pickNdc = new THREE.Vector2()
+// 地面渐变中心（世界坐标 xz）的临时向量，避免每帧新建对象
+const _fadeCenter2 = new THREE.Vector2()
 // 退出聚焦时用于平滑回到常态（记住上一次的聚焦目标）
 const _lastFocusTarget = new THREE.Vector3()
 let lastFocusDistance = CAMERA_START_DISTANCE
@@ -240,7 +275,7 @@ function elevationForDistance(value: number) {
   return THREE.MathUtils.degToRad(deg)
 }
 
-/** 缩放(距离) -> 网格渐变"结束半径"比例：缩到最小(相机最远)=MIN，放到最大(相机最近)=MAX，中间线性 */
+/** 缩放(距离) -> 地面渐变"结束半径"比例：缩到最小(相机最远)=MIN，放到最大(相机最近)=MAX，中间线性 */
 function fadeEndRatioForDistance(value: number) {
   const t = THREE.MathUtils.clamp(
     (value - CAMERA_MIN_DISTANCE) / (CAMERA_MAX_DISTANCE - CAMERA_MIN_DISTANCE),
@@ -250,21 +285,60 @@ function fadeEndRatioForDistance(value: number) {
   return THREE.MathUtils.lerp(GRID_FADE_END_RATIO_MAX, GRID_FADE_END_RATIO_MIN, t)
 }
 
-/** 把当前缩放对应的网格渐变范围写进着色器 */
-function updateGridFadeRange(value: number) {
-  if (!grid) return
-  const material = grid.material as THREE.ShaderMaterial
-  const fadeStart = gridHalfSpan * GRID_FADE_START_RATIO
-  const fadeEnd = Math.max(gridHalfSpan * fadeEndRatioForDistance(value), fadeStart + 1e-4)
-  material.uniforms.uFadeStart.value = fadeStart
-  material.uniforms.uFadeEnd.value = fadeEnd
+/**
+ * 等高线"远处淡出"的范围：
+ * 既保留在自身边缘的淡出（CONTOUR_FADE_START/END_RATIO），
+ * 又保证完全消失的半径不超过网格完全消失半径的 CONTOUR_FADE_MAX_RATIO 倍。
+ * 两者取更靠内的一档；被上限"压"下来时整体等比缩小，淡出的形状（曲线）保持不变。
+ */
+function contourFarFadeRange(gridFadeEnd: number) {
+  const ownStart = contourHalfSpan * CONTOUR_FADE_START_RATIO
+  const ownEnd = Math.max(contourHalfSpan * CONTOUR_FADE_END_RATIO, ownStart + 1e-4)
+  const maxEnd = Math.max(gridFadeEnd * CONTOUR_FADE_MAX_RATIO, 1e-4)
+  // 超过上限时整体等比缩小：保证"完全消失半径 ≤ 1.5 × 网格消失半径"，同时保留淡出形状
+  const k = Math.min(1, maxEnd / ownEnd)
+  return { start: ownStart * k, end: ownEnd * k }
 }
 
-/** 网格渐变中心跟随相机注视点 */
-function updateGridFadeCenter(target: THREE.Vector3) {
-  if (!grid) return
-  const material = grid.material as THREE.ShaderMaterial
-  material.uniforms.uFadeCenter.value.set(target.x, target.z)
+/**
+ * 把当前缩放对应的地面渐变范围写进着色器：
+ * 网格从中心向外淡出到 fadeEnd；等高线则从该 fadeEnd 处开始向外淡入。
+ * 等高线自己的远处淡出范围随缩放变化（因为网格消失半径随缩放变化），见 contourFarFadeRange。
+ */
+function updateGroundFadeRange(value: number) {
+  const fadeStart = gridHalfSpan * GRID_FADE_START_RATIO
+  const fadeEnd = Math.max(gridHalfSpan * fadeEndRatioForDistance(value), fadeStart + 1e-4)
+
+  if (groundGrid) {
+    const material = groundGrid.material as THREE.ShaderMaterial
+    material.uniforms.uFadeStart.value = fadeStart
+    material.uniforms.uFadeEnd.value = fadeEnd
+  }
+  if (groundContour) {
+    const material = groundContour.material as THREE.ShaderMaterial
+    // 从网格完全消失的半径开始，在过渡带内逐渐显现
+    const riseStart = fadeEnd * CONTOUR_TAKEOVER_RATIO
+    material.uniforms.uRiseStart.value = riseStart
+    material.uniforms.uRiseEnd.value = Math.max(
+      riseStart + contourHalfSpan * CONTOUR_RISE_RATIO,
+      riseStart + 1e-4,
+    )
+    // 远处淡出：保留自身边缘的淡出，同时保证完全消失半径不超过网格消失半径的 1.5 倍
+    const far = contourFarFadeRange(fadeEnd)
+    material.uniforms.uFadeStart.value = far.start
+    material.uniforms.uFadeEnd.value = far.end
+  }
+}
+
+/** 地面渐变中心跟随相机注视点（网格与等高线共用） */
+function updateGroundFadeCenter(target: THREE.Vector3) {
+  _fadeCenter2.set(target.x, target.z)
+  if (groundGrid) {
+    (groundGrid.material as THREE.ShaderMaterial).uniforms.uFadeCenter.value.copy(_fadeCenter2)
+  }
+  if (groundContour) {
+    (groundContour.material as THREE.ShaderMaterial).uniforms.uFadeCenter.value.copy(_fadeCenter2)
+  }
 }
 
 /**
@@ -323,8 +397,8 @@ function updateCameraFrame(delta: number) {
   camera.up.copy(WORLD_UP)
   camera.lookAt(_camTarget)
   camera.updateMatrixWorld()
-  updateGridFadeRange(frameDistance)
-  updateGridFadeCenter(_camTarget)
+  updateGroundFadeRange(frameDistance)
+  updateGroundFadeCenter(_camTarget)
 }
 
 /** 缩放：改变相机到注视点的距离（高度角在每帧的 updateCameraFrame 里耦合） */
@@ -1091,8 +1165,6 @@ function createGroundGrid(modelSize: THREE.Vector3) {
   const step = span / GRID_DIVISIONS
 
   gridHalfSpan = half
-  const fadeStart = half * GRID_FADE_START_RATIO
-  const fadeEnd = Math.max(half * fadeEndRatioForDistance(distance), fadeStart + 1e-4)
 
   const positions: number[] = []
   for (let i = 0; i <= GRID_DIVISIONS; i++) {
@@ -1104,14 +1176,46 @@ function createGroundGrid(modelSize: THREE.Vector3) {
   const geometry = new THREE.BufferGeometry()
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
 
-  const material = new THREE.ShaderMaterial({
+  const material = createGroundFadeMaterial(GRID_COLOR, GRID_OPACITY, 'fadeOut')
+
+  // 网格位于 y = 0 平面，x/z 会跟随模型同步
+  return new THREE.LineSegments(geometry, material)
+}
+
+/**
+ * 地面（网格 / 等高线）共用的径向材质：
+ * 透明度按"世界坐标到相机注视点(CAMERA_TARGET)的距离"计算，所以渐变始终以相机注视位置为中心，
+ * 与地面自身的位置无关；渐变范围随缩放变化（缩得越小、范围越大）。
+ * 两者都有一圈"外圈淡出"，区别是起点不同：
+ *  - 'fadeOut'（网格）：从中心向外就开始变淡，到网格淡出结束半径处完全消失（结束半径随缩放变化）；
+ *  - 'rise'（等高线）：先保持透明，到"网格完全消失的半径"再向外逐渐显现；
+ *    它的外圈淡出走 contourFarFadeRange（自身边缘淡出 + 不超过网格消失半径 1.5 倍），
+ *    用于把方形的几何边界藏掉。
+ */
+function createGroundFadeMaterial(color: number, opacity: number, mode: 'fadeOut' | 'rise') {
+  const gridFadeStart = gridHalfSpan * GRID_FADE_START_RATIO
+  const gridFadeEnd = Math.max(
+    gridHalfSpan * fadeEndRatioForDistance(distance),
+    gridFadeStart + 1e-4,
+  )
+  const far = contourFarFadeRange(gridFadeEnd)
+  const fadeStart = mode === 'fadeOut' ? gridFadeStart : far.start
+  const fadeEnd = mode === 'fadeOut' ? gridFadeEnd : far.end
+  // 等高线接棒点 = 网格完全消失处（CONTOUR_TAKEOVER_RATIO = 1）；再向外一个过渡带内逐渐完全显示
+  const riseStart = gridFadeEnd * CONTOUR_TAKEOVER_RATIO
+  const riseEnd = Math.max(riseStart + contourHalfSpan * CONTOUR_RISE_RATIO, riseStart + 1e-4)
+
+  return new THREE.ShaderMaterial({
     uniforms: {
-      uColor: { value: new THREE.Color(GRID_COLOR) },
-      uOpacity: { value: GRID_OPACITY },
+      uColor: { value: new THREE.Color(color) },
+      uOpacity: { value: opacity },
       uFadeCenter: { value: new THREE.Vector2(CAMERA_TARGET.x, CAMERA_TARGET.z) },
       uFadeStart: { value: fadeStart },
       uFadeEnd: { value: fadeEnd },
       uFadeCurve: { value: GRID_FADE_CURVE },
+      uRise: { value: mode === 'rise' ? 1 : 0 },
+      uRiseStart: { value: riseStart },
+      uRiseEnd: { value: riseEnd },
     },
     vertexShader: /* glsl */ `
       varying vec3 vWorldPosition;
@@ -1128,11 +1232,18 @@ function createGroundGrid(modelSize: THREE.Vector3) {
       uniform float uFadeStart;
       uniform float uFadeEnd;
       uniform float uFadeCurve;
+      uniform float uRise;
+      uniform float uRiseStart;
+      uniform float uRiseEnd;
       varying vec3 vWorldPosition;
       void main() {
         float radius = distance(vWorldPosition.xz, uFadeCenter);
         float t = clamp((radius - uFadeStart) / max(uFadeEnd - uFadeStart, 1e-4), 0.0, 1.0);
-        float alpha = pow(1.0 - t, uFadeCurve) * uOpacity;
+        // 外圈淡出：网格从中心就开始，等高线固定在远处边缘
+        float fadeOut = pow(1.0 - t, uFadeCurve);
+        // 等高线：从网格消失处起向外平滑显现（smoothstep 两端平滑，不会突变）
+        float rise = mix(1.0, smoothstep(uRiseStart, uRiseEnd, radius), uRise);
+        float alpha = fadeOut * rise * uOpacity;
         if (alpha <= 0.001) discard;
         gl_FragColor = vec4(uColor, alpha);
       }
@@ -1140,9 +1251,87 @@ function createGroundGrid(modelSize: THREE.Vector3) {
     transparent: true,
     depthWrite: false,
   })
+}
 
-  // 网格位于 y = 0 平面，x/z 会跟随模型同步
-  return new THREE.LineSegments(geometry, material)
+/**
+ * 地面等高线：把 public/model/contour.glb 摆平并缩放到与网格相同的地面尺寸，
+ * 并在"网格完全消失"的半径之外显示（见 createGroundFadeMaterial 的 rise 模式）。
+ * 源模型是 400×400 的平面等高线（X/Y 为平面，Z 为高程）。
+ */
+function createContourGround(root: THREE.Object3D): THREE.LineSegments | null {
+  let found: THREE.LineSegments | null = null
+  root.traverse((object) => {
+    const candidate = object as THREE.LineSegments
+    if (!found && candidate.isLineSegments) found = candidate
+  })
+  if (!found) return null
+  const lines: THREE.LineSegments = found
+
+  const geometry = lines.geometry
+  geometry.computeBoundingBox()
+  const bounds = geometry.boundingBox ?? new THREE.Box3()
+  const boundsSize = bounds.getSize(new THREE.Vector3())
+  const footprint = Math.max(boundsSize.x, boundsSize.z) || 1
+  const horizontal = Math.max(modelSize.x, modelSize.z) || footprint
+  const span = CONTOUR_SPAN > 0 ? CONTOUR_SPAN : horizontal * CONTOUR_SPAN_RATIO
+  const scale = span / footprint
+
+  // 摆平 + 缩放：GLB 的 +Y(平面) -> 世界 -Z，GLB 的 +Z(高程) -> 世界 +Y
+  geometry.applyMatrix4(
+    new THREE.Matrix4().compose(
+      new THREE.Vector3(),
+      new THREE.Quaternion().setFromEuler(new THREE.Euler(-Math.PI / 2, 0, 0)),
+      new THREE.Vector3(scale, scale, scale * CONTOUR_HEIGHT_SCALE),
+    ),
+  )
+  geometry.computeBoundingBox()
+  const box = geometry.boundingBox ?? new THREE.Box3()
+  const boxCenter = box.getCenter(new THREE.Vector3())
+  // 把几何体原点挪到底面中心，之后直接用 position 放到模型中心即可
+  geometry.translate(-boxCenter.x, -box.min.y, -boxCenter.z)
+  geometry.computeBoundingSphere()
+
+  // 替换 GLTF 自带的纯色材质，改用带径向淡出的材质
+  const sourceMaterial = lines.material
+  if (Array.isArray(sourceMaterial)) {
+    sourceMaterial.forEach((item) => disposeMaterial(item))
+  } else if (sourceMaterial) {
+    disposeMaterial(sourceMaterial)
+  }
+
+  lines.removeFromParent()
+  contourHalfSpan = span / 2
+  // 等高线：从网格完全消失处向外逐渐显现，再在自身远处边缘淡出
+  lines.material = createGroundFadeMaterial(
+    CONTOUR_GROUND_COLOR,
+    CONTOUR_GROUND_OPACITY,
+    'rise',
+  )
+  return lines
+}
+
+/** 创建地面：网格（中心向外淡出）+ 等高线（网格消失处向外显现），都摆到模型中心正下方 */
+function buildGround() {
+  if (!scene || !model) return
+
+  if (!groundGrid) {
+    groundGrid = createGroundGrid(modelSize)
+    groundGrid.position.set(model.position.x, GROUND_Y, model.position.z)
+    scene.add(groundGrid)
+  }
+
+  // 等高线模型可能比地图后加载完，这里只在拿到模型后创建一次
+  if (!groundContour && contourRoot) {
+    groundContour = createContourGround(contourRoot)
+    contourRoot = null
+    if (groundContour) {
+      groundContour.position.set(model.position.x, GROUND_Y, model.position.z)
+      scene.add(groundContour)
+    }
+  }
+
+  updateGroundFadeRange(effectiveDistance)
+  updateGroundFadeCenter(CAMERA_TARGET)
 }
 
 function setupModel(loaded: THREE.Object3D) {
@@ -1165,16 +1354,14 @@ function setupModel(loaded: THREE.Object3D) {
   model = loaded
   modelCenter.copy(center)
   modelBaseY = box.min.y
+  modelSize.copy(size)
 
   addWaterGlow(loaded, size)
   // 信标挂到模型上，随模型移动；位置相对模型中心、底部贴模型底面(box.min.y)
   addBeacons(loaded, modelCenter, modelBaseY)
 
-  // 网格跟随模型：位置与模型保持一致（y 固定在地面平面）
-  grid = createGroundGrid(size)
-  grid.position.x = loaded.position.x
-  grid.position.z = loaded.position.z
-  scene.add(grid)
+  // 地面（网格或等高线）跟随模型：位置与模型保持一致，y 固定在地面平面
+  buildGround()
 
   // 相机初始参数：水平角由 CAMERA_BEARING_DEG 决定，缩放由 CAMERA_START_DISTANCE 决定
   distance = THREE.MathUtils.clamp(
@@ -1431,6 +1618,19 @@ function init() {
     },
   )
 
+  // 地面等高线：与地图并行加载，谁先完成都能正确摆到地图下方
+  loader.load(
+    CONTOUR_URL,
+    (gltf) => {
+      contourRoot = gltf.scene
+      buildGround()
+    },
+    undefined,
+    (error) => {
+      console.error('[BitnpMap] 加载等高线失败:', error)
+    },
+  )
+
   resizeObserver = new ResizeObserver(resize)
   resizeObserver.observe(container)
   window.addEventListener('resize', resize)
@@ -1439,10 +1639,16 @@ function init() {
     animationId = requestAnimationFrame(renderLoop)
     const delta = Math.min(beaconClock.getDelta(), 0.1)
     beaconElapsed += delta
-    // 网格随模型一起移动（渐变中心固定在相机注视点，由着色器处理）
-    if (grid && model) {
-      grid.position.x = model.position.x
-      grid.position.z = model.position.z
+    // 地面（网格 + 等高线）随模型一起移动（渐变中心固定在相机注视点，由着色器处理）
+    if (model) {
+      if (groundGrid) {
+        groundGrid.position.x = model.position.x
+        groundGrid.position.z = model.position.z
+      }
+      if (groundContour) {
+        groundContour.position.x = model.position.x
+        groundContour.position.z = model.position.z
+      }
     }
     updateCameraFrame(delta)
     updateBeaconStates(delta)
@@ -1510,7 +1716,10 @@ function dispose() {
   labelScene = null
   camera = null
   model = null
-  grid = null
+  groundGrid = null
+  groundContour = null
+  if (contourRoot) disposeObjectTree(contourRoot)
+  contourRoot = null
   beaconGroup = null
   beaconRuntimes.length = 0
   beaconLabels.length = 0
